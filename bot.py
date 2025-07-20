@@ -1,6 +1,5 @@
-# bot.py – Blindfold Memo Trainer with emoji buttons
-import os
-import random
+# bot.py – 3×3 Blindfold Trainer with global Stats & Exit
+import os, random
 from typing import List
 
 from telegram import (
@@ -22,79 +21,71 @@ from telegram.ext import (
     filters,
 )
 
-# ────────────── Config & Helpers ──────────────
-EXCLUDED = {"A", "R", "E"}
-LETTERS = [c for c in "ABCDEFGHIJKLMNOPQRSTUVWX" if c not in EXCLUDED]
-DUP_CHANCE = 0.15
+# ───────── Config & Helpers ─────────
+CORNER_LETTERS = list("ABCDEFGH")
+EDGE_LETTERS   = list("IJKLMNOPQRST")
+DUP_CHANCE     = 0.15
 
-SHOW_MEMO, WAIT_MATH, WAIT_RECALL = range(3)
+SHOW_MEMO, WAIT_MATH, WAIT_RECALL_EDGES, WAIT_RECALL_CORNERS = range(4)
 
-# Emoji buttons: 🧠 to start/go, 🛑 to exit, 📊 for stats
+# 🧠 to start, 🛑 to exit, 📊 for stats
 MAIN_KB = ReplyKeyboardMarkup(
-    [
-        [KeyboardButton("🧠"), KeyboardButton("🛑"), KeyboardButton("📊")]
-    ],
+    [[KeyboardButton("🧠"), KeyboardButton("🛑"), KeyboardButton("📊")]],
     resize_keyboard=True,
 )
 
-def rand_int(a: int, b: int) -> int:
+def rint(a: int, b: int) -> int:
     return random.randint(a, b)
 
-def next_length(n: int) -> int:
-    return n + 1 if n < 9 else rand_int(7, 9)
+def next_len(n: int, maxn: int, minrnd: int) -> int:
+    return n + 1 if n < maxn else rint(minrnd, maxn)
 
-def gen_memo(k: int) -> List[str]:
+def gen_memo_set(letters: List[str], length: int) -> List[str]:
     memo: List[str] = []
-    while len(memo) < k:
-        L = random.choice(LETTERS)
-        if (
-            not memo
-            or (
-                L != memo[0]
-                and L != memo[-1]
-                and (L not in memo or random.random() < DUP_CHANCE)
-            )
-        ):
-            memo.append(L)
+    while len(memo) < length:
+        L = random.choice(letters)
+        if memo and (L == memo[0] or L == memo[-1]):
+            continue
+        if L in memo and random.random() > DUP_CHANCE:
+            continue
+        memo.append(L)
     return memo
 
 def format_feedback(correct: List[str], guess: List[str]):
-    corr_txt, guess_txt = [], []
-    score = 0
+    c_txt, g_txt = [], []
+    hits = 0
     for c, g in zip(correct, guess):
         if c == g:
-            score += 1
-            corr_txt.append(f"`{c.lower()}`")
-            guess_txt.append(f"`{g.lower()}`")
+            hits += 1
+            c_txt.append(f"`{c.lower()}`")
+            g_txt.append(f"`{g.lower()}`")
         else:
-            corr_txt.append(f"*{c}*")
-            guess_txt.append(f"*{(g or '·').upper()}*")
-    text = (
-        f"*Correct*: {' '.join(corr_txt)}\n"
-        f"*Yours  *: {' '.join(guess_txt)}\n"
-        f"*Score  *: {score}/{len(correct)}"
+            c_txt.append(f"*{c}*")
+            g_txt.append(f"*{(g or '·').upper()}*")
+    return (
+        f"*Correct*: {' '.join(c_txt)}\n"
+        f"*Yours  *: {' '.join(g_txt)}\n"
+        f"*Score  *: {hits}/{len(correct)}",
+        hits,
     )
-    return text, score
 
 async def send_new(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE, text: str, **kwargs):
-    """Delete previous bot message, send a fresh one, store its ID."""
-    old = ctx.user_data.get("msg_id")
-    if old:
-        try:
-            await ctx.bot.delete_message(chat_id, old)
-        except:
-            pass
+    """Delete old bot msg and send a new one, store its ID."""
+    prev = ctx.user_data.get("msg_id")
+    if prev:
+        try: await ctx.bot.delete_message(chat_id, prev)
+        except: pass
     msg = await ctx.bot.send_message(chat_id, text, **kwargs)
     ctx.user_data["msg_id"] = msg.message_id
     return msg
 
-# ────────────── Handlers ──────────────
+# ───────── Handlers ─────────
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Welcome screen with emoji buttons."""
-    # reset per-round state (keep stats)
+    """/start → welcome screen."""
     ctx.user_data.update(
         level=1,
-        length=5,
+        corner_len=3,
+        edge_len=5,
         msg_id=None,
         correct_letters=0,
         attempted_letters=0,
@@ -103,44 +94,45 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await send_new(
         update.effective_chat.id,
         ctx,
-        "👋 *Welcome to the blind trainer*\n\n"
-        "Press 🧠 to begin, 🛑 to quit, or 📊 for stats.",
+        "👋 *Welcome to the 3×3 blind trainer*\n\n"
+        "Press 🧠 to generate edge & corner strings,\n"
+        "🛑 to exit, or 📊 for stats.",
         parse_mode=constants.ParseMode.MARKDOWN,
         reply_markup=MAIN_KB,
     )
     return ConversationHandler.END
 
 async def go_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """🧠 → show memo with inline “Let’s go”."""
+    """🧠 → show edges & corners with ‘Let’s go’ button."""
     chat = update.effective_chat.id
-    length = ctx.user_data.get("length", 5)
-    memo = gen_memo(length)
-    ctx.user_data["memo"] = memo
+    cl = ctx.user_data["corner_len"]
+    el = ctx.user_data["edge_len"]
+    corners = gen_memo_set(CORNER_LETTERS, cl)
+    edges   = gen_memo_set(EDGE_LETTERS, el)
+    ctx.user_data.update(corners=corners, edges=edges)
 
-    kb_inline = InlineKeyboardMarkup.from_button(
+    kb = InlineKeyboardMarkup.from_button(
         InlineKeyboardButton("Let’s go", callback_data="letsgo")
     )
-
     await send_new(
-        chat,
-        ctx,
-        f"*Level {ctx.user_data.get('level',1)}*  (len {length})\n"
-        "`" + " ".join(memo) + "`",
+        chat, ctx,
+        f"*Level {ctx.user_data['level']}*\n"
+        f"Edges ({el}): `{' '.join(edges)}`\n"
+        f"Corners ({cl}): `{' '.join(corners)}`",
         parse_mode=constants.ParseMode.MARKDOWN,
-        reply_markup=kb_inline,
+        reply_markup=kb,
     )
     return SHOW_MEMO
 
 async def letsgo_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Inline “Let’s go” → distraction task."""
+    """Inline ‘Let’s go’ → distraction math."""
     await update.callback_query.answer()
     chat = update.effective_chat.id
-    a, b = rand_int(1000, 9999), rand_int(1000, 9999)
+    a, b = rint(1000, 9999), rint(1000, 9999)
     ctx.user_data["math_ans"] = a + b
 
     await send_new(
-        chat,
-        ctx,
+        chat, ctx,
         "🧮 *Distraction task*\n"
         f"`{a} + {b} = ?`\n\nSend the answer.",
         parse_mode=constants.ParseMode.MARKDOWN,
@@ -149,120 +141,138 @@ async def letsgo_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return WAIT_MATH
 
 async def handle_math(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """User answers math → verdict + prompt for memo."""
+    """Math answer → verdict + prompt for edges."""
     chat = update.effective_chat.id
-    txt = update.message.text.strip()
     try:
-        val = int(txt)
+        val = int(update.message.text.strip())
     except ValueError:
-        await update.message.reply_text("❌ Please send a number.")
+        await update.message.reply_text("❌ Send a valid number.")
         return WAIT_MATH
 
-    correct = ctx.user_data["math_ans"]
-    verdict = "✅ Correct!" if val == correct else f"❌ Incorrect (was {correct})"
-
+    ok = val == ctx.user_data["math_ans"]
+    verdict = "✅ Correct!" if ok else f"❌ Incorrect (was {ctx.user_data['math_ans']})"
     await send_new(
-        chat,
-        ctx,
-        verdict + "\n\nNow send the memo string (letters only).",
+        chat, ctx,
+        verdict + "\n\nNow send the *edges* string.",
         parse_mode=constants.ParseMode.MARKDOWN,
         reply_markup=MAIN_KB,
     )
-    return WAIT_RECALL
+    return WAIT_RECALL_EDGES
 
-async def handle_recall(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """User sends memo → show feedback + stats + back to emoji keyboard."""
+async def handle_edges(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Edges recall → feedback + prompt corners."""
     chat = update.effective_chat.id
-    memo = ctx.user_data["memo"]
+    edges = ctx.user_data["edges"]
     guess = update.message.text.strip().upper()
+    if len(guess) != len(edges):
+        await update.message.reply_text(f"Need {len(edges)} letters for edges.")
+        return WAIT_RECALL_EDGES
 
-    if len(guess) != len(memo):
-        await update.message.reply_text(f"Need exactly {len(memo)} letters.")
-        return WAIT_RECALL
+    fb, hits = format_feedback(edges, list(guess))
+    ctx.user_data["correct_letters"]   += hits
+    ctx.user_data["attempted_letters"] += len(edges)
+    ctx.user_data["last_edge_hits"]     = hits
 
-    fb_text, score = format_feedback(memo, list(guess))
-    ctx.user_data["correct_letters"] += score
-    ctx.user_data["attempted_letters"] += len(memo)
-    if score == len(memo):
+    await send_new(
+        chat, ctx,
+        fb + "\n\nNow send the *corners* string.",
+        parse_mode=constants.ParseMode.MARKDOWN,
+        reply_markup=MAIN_KB,
+    )
+    return WAIT_RECALL_CORNERS
+
+async def handle_corners(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Corners recall → final feedback + stats + back to main."""
+    chat = update.effective_chat.id
+    corners = ctx.user_data["corners"]
+    guess   = update.message.text.strip().upper()
+    if len(guess) != len(corners):
+        await update.message.reply_text(f"Need {len(corners)} letters for corners.")
+        return WAIT_RECALL_CORNERS
+
+    fb, hits = format_feedback(corners, list(guess))
+    ctx.user_data["correct_letters"]   += hits
+    ctx.user_data["attempted_letters"] += len(corners)
+
+    # full solve = perfect edges + perfect corners
+    if (hits == len(corners)
+        and ctx.user_data.get("last_edge_hits",0) == len(ctx.user_data["edges"])):
         ctx.user_data["puzzles_solved"] += 1
 
-    acc = (
-        ctx.user_data["correct_letters"] * 100
-        // ctx.user_data["attempted_letters"]
-    )
+    acc = ctx.user_data["correct_letters"] * 100 // ctx.user_data["attempted_letters"]
 
     await send_new(
-        chat,
-        ctx,
-        fb_text
+        chat, ctx,
+        fb
         + f"\n\n🎯 *{acc}%* accuracy\n"
-        f"🎉 *{ctx.user_data['puzzles_solved']}* perfect solves\n\n"
-        "Press 🧠 to play again, 🛑 to quit, or 📊 for stats.",
+        f"🎉 *{ctx.user_data['puzzles_solved']}* full solves\n\n"
+        "Press 🧠 for next, 🛑 to quit, 📊 for stats.",
         parse_mode=constants.ParseMode.MARKDOWN,
         reply_markup=MAIN_KB,
     )
 
-    ctx.user_data["level"] += 1
-    ctx.user_data["length"] = next_length(ctx.user_data["length"])
+    ctx.user_data["level"]      += 1
+    ctx.user_data["corner_len"] = next_len(ctx.user_data["corner_len"], len(CORNER_LETTERS), 3)
+    ctx.user_data["edge_len"]   = next_len(ctx.user_data["edge_len"],   len(EDGE_LETTERS),   5)
     return ConversationHandler.END
 
 async def exit_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """🛑 → goodbye message."""
+    """🛑 → always say goodbye."""
     await send_new(
-        update.effective_chat.id,
-        ctx,
-        "👋 *Goodbye!* Thanks for training. Press 🧠 to start over anytime.",
+        update.effective_chat.id, ctx,
+        "👋 *Goodbye!* Come back anytime with 🧠.",
         parse_mode=constants.ParseMode.MARKDOWN,
         reply_markup=MAIN_KB,
     )
     return ConversationHandler.END
 
 async def stats_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """📊 → show total perfect solves."""
+    """📊 → always show stats."""
     solved = ctx.user_data.get("puzzles_solved", 0)
     await send_new(
-        update.effective_chat.id,
-        ctx,
-        f"📊 You’ve perfectly solved *{solved}* memo(s).",
+        update.effective_chat.id, ctx,
+        f"📊 You’ve full‑solved *{solved}* cubes.",
         parse_mode=constants.ParseMode.MARKDOWN,
         reply_markup=MAIN_KB,
     )
 
-# ────────────── Main ──────────────
+# ───────── Main ─────────
 def main():
-    token = os.getenv("BOT_TOKEN") or exit("Set BOT_TOKEN")
+    TOKEN = os.getenv("BOT_TOKEN") or exit("Set BOT_TOKEN")
     app = (
         Application.builder()
-        .token(token)
-        .persistence(PicklePersistence("memo_data"))
+        .token(TOKEN)
+        .persistence(PicklePersistence("memo3x3_data"))
         .build()
     )
 
     conv = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex("^🧠$"), go_handler)],
+        entry_points=[CommandHandler("start", start),
+                      MessageHandler(filters.Regex("^🧠$"), go_handler)],
         states={
             SHOW_MEMO: [
                 CallbackQueryHandler(letsgo_cb, pattern="^letsgo$"),
-                MessageHandler(filters.Regex("^🛑$"), exit_handler),
             ],
             WAIT_MATH: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_math),
-                MessageHandler(filters.Regex("^🛑$"), exit_handler),
             ],
-            WAIT_RECALL: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_recall),
-                MessageHandler(filters.Regex("^🛑$"), exit_handler),
+            WAIT_RECALL_EDGES: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_edges),
+            ],
+            WAIT_RECALL_CORNERS: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_corners),
             ],
         },
-        fallbacks=[MessageHandler(filters.Regex("^🛑$"), exit_handler)],
-        name="memo_conv",
+        fallbacks=[],
+        name="memo3x3_conv",
         persistent=True,
     )
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(conv)
+    # Global handlers for Exit & Stats
+    app.add_handler(MessageHandler(filters.Regex("^🛑$"), exit_handler))
     app.add_handler(MessageHandler(filters.Regex("^📊$"), stats_handler))
-    app.add_handler(CommandHandler("stats", stats_handler))
+
+    app.add_handler(conv)
 
     print("Bot running… Ctrl‑C to stop.")
     app.run_polling()
